@@ -1,0 +1,107 @@
+name: Build Nokia 7 Plus KSU kernel (4.4.192)
+
+on:
+  push:
+    branches: [ ci, ksu-4.4.192 ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    env:
+      KERNEL_SOURCE_TAG: kernel-source-4.16H
+      KERNEL_SOURCE_ASSET: Nokia7plus_V4.16H.tar.gz
+      STOCK_BOOT_ASSET: boot_b_stock.img
+      KSU_TAG: v4.2.0-rc3
+      LOCALVERSION: "+"
+
+    steps:
+      - name: Checkout CI branch
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc bison flex cpio libssl-dev make python3 git patch
+
+      - name: Download Nokia 4.16H kernel source
+        run: |
+          mkdir -p kernel
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${KERNEL_SOURCE_TAG}/${KERNEL_SOURCE_ASSET}"
+          echo "Downloading: $url"
+          curl -L --fail --retry 3 -o kernel-source.tar.gz "$url"
+          tar -xzf kernel-source.tar.gz -C kernel --strip-components=4 LINUX/android/kernel/msm-4.4
+          test -f kernel/Makefile
+          head -5 kernel/Makefile
+
+      - name: Download GCC 4.9 toolchain (LineageOS prebuilt mirror)
+        run: |
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
+            toolchain
+          toolchain/bin/aarch64-linux-android-gcc --version | head -1
+
+      - name: Integrate BakaSU and manual hooks
+        run: |
+          cd kernel
+          git clone --branch "${KSU_TAG}" https://github.com/Baka-SU/BakaSU KernelSU
+          ln -s ../KernelSU/kernel drivers/kernelsu
+          patch -p1 < ../ci/patches/0001-kernelsu-manual-hooks.patch
+          mkdir -p out
+          cp ../ci/kernel.config out/.config
+          echo "KSU version: $(cd KernelSU && git rev-list --count HEAD)"
+          echo "KSU tag: $(cd KernelSU && git describe --tags --abbrev=0)"
+
+      - name: Build Image.gz-dtb
+        run: |
+          set -o pipefail
+          export PATH="$GITHUB_WORKSPACE/toolchain/bin:$PATH"
+          cd kernel
+          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-android- \
+            CC=aarch64-linux-android-gcc -j"$(nproc)" HOSTCFLAGS=-fcommon \
+            Image.gz-dtb 2>&1 | tee build.log
+          test -f out/arch/arm64/boot/Image.gz
+          test -f out/arch/arm64/boot/Image.gz-dtb
+          ls -lh out/arch/arm64/boot/Image.gz out/arch/arm64/boot/Image.gz-dtb
+
+      - name: Download stock boot_b image
+        run: |
+          set -o pipefail
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${KERNEL_SOURCE_TAG}/${STOCK_BOOT_ASSET}"
+          echo "Downloading: $url"
+          curl -L --fail --retry 3 -o boot_b_stock.img "$url"
+          ls -lh boot_b_stock.img
+          md5sum boot_b_stock.img || true
+
+      - name: Repack flashable boot_b-ksu.img
+        run: |
+          python3 ci/repack_boot.py \
+            --stock boot_b_stock.img \
+            --kernel kernel/out/arch/arm64/boot/Image.gz \
+            --output boot_b-ksu.img
+          ls -lh boot_b-ksu.img
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nokia-B2N-4.4.192-KSU-${{ env.KSU_TAG }}
+          if-no-files-found: error
+          path: |
+            boot_b-ksu.img
+            kernel/out/arch/arm64/boot/Image.gz
+            kernel/out/arch/arm64/boot/Image.gz-dtb
+            kernel/out/.config
+            kernel/build.log
+
+      - name: Upload failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-failure
+          if-no-files-found: warn
+          path: kernel/build.log
